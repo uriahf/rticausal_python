@@ -12,21 +12,18 @@ def create_summary_report(
     probs: Mapping[str, np.ndarray],
     reals: np.ndarray,
     treats: np.ndarray | None = None,
+    intervention: object | None = None,
     weights: np.ndarray | None = None,
     *,
     output_file: str | Path | None = None,
     **kwargs,
 ):
-    """Create a summary report containing only calibration.
-
-    The returned object is the same Plotly calibration figure used by
-    ``create_calibration_curve``. When ``output_file`` is supplied, the figure
-    is also written as a self-contained HTML document.
-    """
+    """Create a summary report containing only calibration."""
     calibration = create_calibration_curve(
         probs=probs,
         reals=reals,
         treats=treats,
+        intervention=intervention,
         weights=weights,
         **kwargs,
     )
