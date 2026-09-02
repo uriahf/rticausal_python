@@ -1,0 +1,26 @@
+[project]
+name = "rticausal"
+version = "0.0.1"
+description = "External validation and evaluation of predictions under interventions"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{name = "Uriah Finkel"}]
+license = {text = "MIT"}
+dependencies = [
+    "numpy>=2.0",
+    "polars>=1.31.0",
+    "rtichoke>=0.1.36",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=7.3,<9",
+    "ruff>=0.11",
+]
+
+[build-system]
+requires = ["uv_build>=0.7.20,<0.8.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 88
