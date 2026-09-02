@@ -12,26 +12,46 @@ def test_factual_calibration_delegates_to_rtichoke():
     assert figure.data
 
 
-def test_intervention_calibration_uses_treatment_specific_outcomes():
+def test_intervention_calibration_separates_treatment_from_model_identity():
     probs = {
-        "0": np.linspace(0.05, 0.95, 20),
-        "1": np.linspace(0.95, 0.05, 20),
+        "model_a": np.linspace(0.05, 0.95, 40),
+        "model_b": np.linspace(0.10, 0.90, 40),
     }
-    reals = np.tile(np.array([0, 1]), 10)
-    treats = np.tile(np.array([0, 1]), 10)
+    reals = np.tile(np.array([0, 1]), 20)
+    treats = np.tile(np.array([0, 0, 1, 1]), 10)
 
     prepared = _prepare_intervention_calibration(
         probs=probs,
         reals=reals,
         treats=treats,
+        intervention=1,
         weights=None,
         size=600,
         color_values=None,
     )
 
+    groups = set(prepared["deciles_dat"].get_column("reference_group").to_list())
+    assert groups == {"model_a", "model_b"}
     observed = prepared["deciles_dat"].get_column("y").to_numpy()
     assert np.all(np.isfinite(observed))
     assert np.all((observed >= 0) & (observed <= 1))
+
+
+def test_intervention_must_match_observed_treatment_level():
+    try:
+        _prepare_intervention_calibration(
+            probs={"model": np.linspace(0.1, 0.9, 20)},
+            reals=np.tile(np.array([0, 1]), 10),
+            treats=np.tile(np.array([0, 1]), 10),
+            intervention=2,
+            weights=None,
+            size=600,
+            color_values=None,
+        )
+    except ValueError as exc:
+        assert "observed treatment level" in str(exc)
+    else:
+        raise AssertionError("Expected invalid intervention to raise ValueError")
 
 
 def test_summary_report_contains_only_calibration(tmp_path):
