@@ -16,6 +16,7 @@ def create_calibration_curve(
     probs: Mapping[str, np.ndarray],
     reals: np.ndarray,
     treats: np.ndarray | None = None,
+    intervention: object | None = None,
     weights: np.ndarray | None = None,
     *,
     calibration_type: str = "discrete",
@@ -24,21 +25,25 @@ def create_calibration_curve(
 ):
     """Create factual or intervention-specific calibration curves.
 
-    When ``treats`` is omitted, this delegates directly to rtichoke. When
-    ``treats`` is supplied, ``probs`` must contain one prediction vector per
-    intervention and the observed risk in each rtichoke prediction bin is
-    replaced by the treatment-specific weighted outcome mean.
+    When ``treats`` is omitted, this delegates directly to rtichoke. In
+    intervention mode, ``treats`` contains observed treatment assignments and
+    ``intervention`` identifies the treatment level whose counterfactual risks
+    are represented by ``probs``. Keys in ``probs`` remain model/series names.
 
     ``weights`` are caller-supplied identification/design weights. rticausal
-    does not fit propensity models.
+    consumes them but does not fit treatment models.
     """
     kwargs = {"calibration_type": calibration_type, "size": size}
     if color_values is not None:
         kwargs["color_values"] = color_values
 
     if treats is None:
+        if intervention is not None or weights is not None:
+            raise ValueError("intervention and weights require treats.")
         return _rtichoke_create_calibration_curve(dict(probs), reals, **kwargs)
 
+    if intervention is None:
+        raise ValueError("intervention is required when treats is supplied.")
     if calibration_type != "discrete":
         raise ValueError(
             "Intervention calibration currently supports only "
@@ -49,6 +54,7 @@ def create_calibration_curve(
         probs=dict(probs),
         reals=np.asarray(reals),
         treats=np.asarray(treats),
+        intervention=intervention,
         weights=None if weights is None else np.asarray(weights),
         size=size,
         color_values=color_values,
@@ -63,17 +69,20 @@ def _prepare_intervention_calibration(
     probs: dict[str, np.ndarray],
     reals: np.ndarray,
     treats: np.ndarray,
+    intervention: object,
     weights: np.ndarray | None,
     size: int,
     color_values: list[str] | None,
 ) -> dict:
     if not probs or any(not str(key) for key in probs):
-        raise ValueError("probs must be a non-empty mapping with intervention names.")
+        raise ValueError("probs must be a non-empty mapping with model/series names.")
 
     y = np.asarray(reals).reshape(-1)
     a = np.asarray(treats).reshape(-1)
     n = y.shape[0]
-    if a.shape[0] != n or any(np.asarray(p).reshape(-1).shape[0] != n for p in probs.values()):
+    if a.shape[0] != n or any(
+        np.asarray(p).reshape(-1).shape[0] != n for p in probs.values()
+    ):
         raise ValueError("probs, reals, and treats must describe the same observations.")
 
     if weights is None:
@@ -86,19 +95,18 @@ def _prepare_intervention_calibration(
             )
 
     treatment_labels = a.astype(str)
-    missing = set(probs) - set(np.unique(treatment_labels))
-    if missing:
-        raise ValueError(
-            "Every key in probs must match an observed treatment level in treats."
-        )
+    intervention_label = str(intervention)
+    if intervention_label not in set(np.unique(treatment_labels)):
+        raise ValueError("intervention must match an observed treatment level in treats.")
 
     prepare_kwargs = {"size": size}
     if color_values is not None:
         prepare_kwargs["color_values"] = color_values
     prepared = _create_calibration_curve_list(dict(probs), y, **prepare_kwargs)
 
+    selected_weight = w * (treatment_labels == intervention_label)
     adjusted_frames: list[pl.DataFrame] = []
-    for level, raw_probs in probs.items():
+    for series, raw_probs in probs.items():
         p = np.asarray(raw_probs, dtype=float).reshape(-1)
         if np.unique(p).size == 1:
             decile = np.ones(n, dtype=int)
@@ -108,26 +116,31 @@ def _prepare_intervention_calibration(
             ranks[order] = np.arange(1, n + 1)
             decile = ((ranks - 1) * 10 // n) + 1
 
-        selected_weight = w * (treatment_labels == str(level))
-        frame = pl.DataFrame(
-            {
-                "reference_group": [level] * n,
-                "decile": decile,
-                "selected_weight": selected_weight,
-                "weighted_event": selected_weight * y,
-            }
-        ).group_by(["reference_group", "decile"]).agg(
-            pl.col("selected_weight").sum().alias("selected_weight"),
-            pl.col("weighted_event").sum().alias("weighted_event"),
-        ).with_columns(
-            (pl.col("weighted_event") / pl.col("selected_weight")).alias("y")
-        ).select("reference_group", "decile", "y")
+        frame = (
+            pl.DataFrame(
+                {
+                    "reference_group": [series] * n,
+                    "decile": decile,
+                    "selected_weight": selected_weight,
+                    "weighted_event": selected_weight * y,
+                }
+            )
+            .group_by(["reference_group", "decile"])
+            .agg(
+                pl.col("selected_weight").sum().alias("selected_weight"),
+                pl.col("weighted_event").sum().alias("weighted_event"),
+            )
+            .with_columns(
+                (pl.col("weighted_event") / pl.col("selected_weight")).alias("y")
+            )
+            .select("reference_group", "decile", "y")
+        )
         adjusted_frames.append(frame)
 
     adjusted = pl.concat(adjusted_frames)
     if adjusted.filter(~pl.col("y").is_finite()).height:
         raise ValueError(
-            "Each prediction bin must contain positive treatment weight for its intervention."
+            "Each prediction bin must contain positive treatment weight for the intervention."
         )
 
     deciles = prepared["deciles_dat"]
