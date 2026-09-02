@@ -49,14 +49,46 @@ def test_r_cut_groups_matches_ipeval_rank_grouping():
 
 def test_ipeval_calplot_fixture_matches_reference_coordinates():
     probs = np.array(
-        [0.80, 0.10, 0.70, 0.20, 0.60, 0.30, 0.50, 0.40,
-         0.75, 0.15, 0.65, 0.25, 0.55, 0.35, 0.45, 0.05]
+        [
+            0.80,
+            0.10,
+            0.70,
+            0.20,
+            0.60,
+            0.30,
+            0.50,
+            0.40,
+            0.75,
+            0.15,
+            0.65,
+            0.25,
+            0.55,
+            0.35,
+            0.45,
+            0.05,
+        ]
     )
     reals = np.array([1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 0])
     treats = np.array([1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 1, 1])
     weights = np.array(
-        [1.0, 1.2, 0.8, 1.5, 1.1, 0.9, 1.3, 1.0,
-         1.4, 0.7, 1.6, 1.0, 0.6, 1.8, 1.2, 0.5]
+        [
+            1.0,
+            1.2,
+            0.8,
+            1.5,
+            1.1,
+            0.9,
+            1.3,
+            1.0,
+            1.4,
+            0.7,
+            1.6,
+            1.0,
+            0.6,
+            1.8,
+            1.2,
+            0.5,
+        ]
     )
 
     rows = _ipeval_calplot_rows(
@@ -67,15 +99,19 @@ def test_ipeval_calplot_fixture_matches_reference_coordinates():
         groups=4,
     )
 
-    np.testing.assert_allclose(rows.get_column("x").to_numpy(), [0.125, 0.325, 0.525, 0.725])
+    np.testing.assert_allclose(
+        rows.get_column("x").to_numpy(), [0.125, 0.325, 0.525, 0.725]
+    )
 
-    # Weighted observed means in the same four sorted-rank groups.
-    expected_obs = np.array([
-        0.7 / 0.7,
-        (1.5 + 1.0 * 0.0) / (1.5 + 1.0),
-        (1.2 + 1.3 * 0.0 + 1.1 * 0.0) / (1.2 + 1.3 + 1.1),
-        (0.8 + 1.4 + 1.0) / (0.8 + 1.4 + 1.0),
-    ])
+    # Hand-computed from ipeval's sorted-rank groups and weighted.mean rule.
+    expected_obs = np.array(
+        [
+            (0.5 * 0 + 0.7 * 1 + 1.5 * 1) / (0.5 + 0.7 + 1.5),
+            (1.0 * 0 + 1.8 * 0) / (1.0 + 1.8),
+            (1.2 * 1 + 1.3 * 0 + 1.1 * 0) / (1.2 + 1.3 + 1.1),
+            (0.8 * 1 + 1.4 * 1 + 1.0 * 1) / (0.8 + 1.4 + 1.0),
+        ]
+    )
     np.testing.assert_allclose(rows.get_column("y").to_numpy(), expected_obs)
 
 
