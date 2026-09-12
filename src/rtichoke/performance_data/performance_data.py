@@ -1,0 +1,320 @@
+"""
+A module for Performance Data
+"""
+
+from typing import Dict, Union
+import polars as pl
+from collections.abc import Sequence
+from rtichoke.processing.adjustments import _create_adjusted_data_binary
+from rtichoke.processing.combinations import (
+    _create_aj_data_combinations_binary,
+    create_breaks_values,
+)
+from rtichoke.processing.transforms import (
+    _calculate_cumulative_aj_data_binary,
+    _cast_and_join_adjusted_data_binary,
+    _create_list_data_to_adjust_binary,
+    _turn_cumulative_aj_to_performance_data,
+)
+import numpy as np
+
+
+_PERFORMANCE_DATA_COLUMNS = [
+    "reference_group",
+    "stratified_by",
+    "chosen_cutoff",
+    "probability_threshold",
+    "true_positives",
+    "true_negatives",
+    "false_positives",
+    "false_negatives",
+    "predicted_positives",
+    "predicted_negatives",
+    "real_positives",
+    "real_negatives",
+    "n",
+    "sensitivity",
+    "specificity",
+    "ppv",
+    "npv",
+    "false_positive_rate",
+    "lift",
+    "net_benefit",
+    "net_benefit_interventions_avoided",
+    "ppcr",
+]
+
+
+def _validate_and_align_binary_inputs(
+    probs: Dict[str, np.ndarray],
+    reals: Union[np.ndarray, Dict[str, np.ndarray]],
+) -> Union[np.ndarray, Dict[str, np.ndarray]]:
+    """Validate binary input alignment and normalize outcome dictionaries."""
+    if not isinstance(probs, dict) or not probs:
+        raise ValueError(
+            "`probs` must be a non-empty dictionary of probability arrays."
+        )
+
+    groups = list(probs)
+    for group in groups:
+        probs_values = np.asarray(probs[group])
+        if not np.all(np.isfinite(probs_values)) or np.any(
+            (probs_values < 0) | (probs_values > 1)
+        ):
+            raise ValueError("Estimated probabilities must be between 0 and 1.")
+
+    if isinstance(reals, dict):
+        expected_keys = set(groups)
+        if set(reals) != expected_keys:
+            raise ValueError("`reals` dictionary keys must exactly match `probs`.")
+
+        for group in groups:
+            reals_values = np.asarray(reals[group])
+            n_probs = len(np.asarray(probs[group]))
+            n_reals = len(reals_values)
+            if n_probs != n_reals:
+                raise ValueError(
+                    f"Input lengths must match within group {group!r}: "
+                    f"len(probs)={n_probs}, len(reals)={n_reals}."
+                )
+            if not np.all(np.isin(reals_values, [0, 1])):
+                raise ValueError("Binary outcomes must contain only 0 and 1.")
+
+        if len(groups) == 1:
+            return np.asarray(reals[groups[0]])
+
+        return {group: np.asarray(reals[group]) for group in groups}
+
+    reals_values = np.asarray(reals)
+    if not np.all(np.isin(reals_values, [0, 1])):
+        raise ValueError("Binary outcomes must contain only 0 and 1.")
+
+    n_reals = len(reals_values)
+    for group in groups:
+        n_probs = len(np.asarray(probs[group]))
+        if n_probs != n_reals:
+            raise ValueError(
+                f"Shared outcome length must match probabilities for group {group!r}: "
+                f"len(probs)={n_probs}, len(reals)={n_reals}."
+            )
+
+    return reals
+
+
+def _probs_with_r_binary_cutoff_semantics(
+    probs: Dict[str, np.ndarray], by: float
+) -> Dict[str, np.ndarray]:
+    """Place exact binary cutoffs on R's predicted-negative side.
+
+    R's binary implementation uses ``prob > cutoff``. The shared Python binning
+    machinery is left-closed because the time-dependent path intentionally
+    follows a ``prob >= cutoff`` convention. Move only binary probabilities
+    exactly equal to a public cutoff one representable float downward before
+    bin assignment; all other probabilities and the public cutoff grid remain
+    unchanged.
+    """
+    cutoffs = create_breaks_values(None, "probability_threshold", by)
+    nonzero_cutoffs = cutoffs[cutoffs > 0]
+    adjusted = {}
+
+    for reference_group, values in probs.items():
+        values_array = np.asarray(values, dtype=float).copy()
+        for cutoff in nonzero_cutoffs:
+            equal_to_cutoff = values_array == cutoff
+            values_array[equal_to_cutoff] = np.nextafter(
+                values_array[equal_to_cutoff], -np.inf
+            )
+        adjusted[reference_group] = values_array
+
+    return adjusted
+
+
+def prepare_binned_classification_data(
+    probs: Dict[str, np.ndarray],
+    reals: Union[np.ndarray, Dict[str, np.ndarray]],
+    stratified_by: Sequence[str] = ("probability_threshold",),
+    by: float = 0.01,
+) -> pl.DataFrame:
+    """
+    Prepare probability-binned classification data for binary outcomes.
+
+    This function serves as the foundation for many of the performance analysis
+    visualizations. It takes predicted probabilities and true binary outcomes,
+    bins them by probability thresholds, and calculates the number of true
+    positives, false positives, true negatives, and false negatives within each
+    bin. This detailed, binned data can then be used to generate calibration
+    plots or be aggregated to compute various performance metrics.
+
+    Parameters
+    ----------
+    probs : Dict[str, np.ndarray]
+        A dictionary mapping model or dataset names (str) to their predicted
+        probabilities (1-D numpy arrays).
+    reals : Union[np.ndarray, Dict[str, np.ndarray]]
+        The true event labels. This can be a single numpy array that is aligned
+        with all pooled probabilities or a dictionary mapping each dataset name
+        to its corresponding array of true labels. Labels must be binary (0 or 1).
+    stratified_by : Sequence[str], optional
+        A sequence of strings specifying the variables by which to stratify the
+        data. The default is ``("probability_threshold",)``, which bins the data
+        based on predicted probabilities.
+    by : float, optional
+        The step size to use when creating bins for the probability thresholds.
+        This determines the granularity of the analysis. Defaults to ``0.01``.
+
+    Returns
+    -------
+    pl.DataFrame
+        A Polars DataFrame containing the binned classification data. Each row
+        represents a unique combination of model/dataset, probability bin, and
+        any other stratification variables. It forms the basis for subsequent
+        performance calculations.
+    """
+    reals = _validate_and_align_binary_inputs(probs=probs, reals=reals)
+    breaks = create_breaks_values(None, "probability_threshold", by)
+
+    aj_data_combinations = _create_aj_data_combinations_binary(
+        list(probs.keys()),
+        stratified_by=stratified_by,
+        by=by,
+        breaks=breaks,
+    )
+
+    probs_for_binning = (
+        _probs_with_r_binary_cutoff_semantics(probs, by)
+        if "probability_threshold" in stratified_by
+        else probs
+    )
+
+    list_data_to_adjust = _create_list_data_to_adjust_binary(
+        aj_data_combinations,
+        probs_for_binning,
+        reals,
+        stratified_by=stratified_by,
+        by=by,
+    )
+
+    adjusted_data = _create_adjusted_data_binary(
+        list_data_to_adjust,
+        breaks=breaks,
+        stratified_by=stratified_by,
+    )
+
+    final_adjusted_data = _cast_and_join_adjusted_data_binary(
+        aj_data_combinations,
+        adjusted_data,
+    )
+
+    return final_adjusted_data
+
+
+def prepare_performance_data(
+    probs: Dict[str, np.ndarray],
+    reals: Union[np.ndarray, Dict[str, np.ndarray]],
+    stratified_by: Sequence[str] = ("probability_threshold",),
+    by: float = 0.01,
+) -> pl.DataFrame:
+    """Prepare performance data for binary classification models.
+
+    This function computes a comprehensive set of performance metrics for one
+    or more binary classification models across a range of probability
+    thresholds. It builds upon the binned data from
+    `prepare_binned_classification_data` by cumulatively summing the counts
+    and calculating metrics like sensitivity (TPR), specificity, precision
+    (PPV), and net benefit.
+
+    This resulting dataframe is the primary input for plotting functions like
+    `plot_roc_curve`, `plot_precision_recall_curve`, etc.
+
+    Parameters
+    ----------
+    probs : Dict[str, np.ndarray]
+        A dictionary mapping model or dataset names (str) to their predicted
+        probabilities (1-D numpy arrays).
+    reals : Union[np.ndarray, Dict[str, np.ndarray]]
+        The true event labels. This can be a single numpy array that is aligned
+        with all pooled probabilities or a dictionary mapping each dataset name
+        to its corresponding array of true labels. Labels must be binary (0 or 1).
+    stratified_by : Sequence[str], optional
+        A sequence of strings specifying the variables by which to stratify the
+        data. The default is ``("probability_threshold",)``.
+    by : float, optional
+        The step size for probability thresholds, determining the number of
+        points at which performance is evaluated. Defaults to ``0.01``.
+
+    Returns
+    -------
+    pl.DataFrame
+        A Polars DataFrame where each row corresponds to an operating point for a
+        given model/dataset. Columns include `chosen_cutoff` (requested grid value),
+        `probability_threshold` (effective score boundary corresponding to the grid
+        point), `ppcr`, and a rich set of performance metrics (e.g., `sensitivity`,
+        `specificity`, `ppv`, `net_benefit`).
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> probs_dict_test = {
+    ...     "small_data_set": np.array(
+    ...         [0.9, 0.85, 0.95, 0.88, 0.6, 0.7, 0.51, 0.2, 0.1, 0.33]
+    ...     )
+    ... }
+    >>> reals_dict_test = [1, 1, 1, 1, 0, 0, 1, 0, 0, 1]
+    >>> performance_df = prepare_performance_data(
+    ...     probs=probs_dict_test,
+    ...     reals=reals_dict_test,
+    ...     by=0.1
+    ... )
+    """
+    final_adjusted_data = prepare_binned_classification_data(
+        probs=probs,
+        reals=reals,
+        stratified_by=stratified_by,
+        by=by,
+    )
+
+    cumulative_aj_data = _calculate_cumulative_aj_data_binary(final_adjusted_data)
+
+    performance_data = _turn_cumulative_aj_to_performance_data(cumulative_aj_data)
+
+    prob_threshold_rows = []
+    for group_name, probs_array in probs.items():
+        probs_g = np.asarray(probs_array, dtype=float)
+        unique_cutoffs = performance_data.filter(
+            pl.col("reference_group") == group_name
+        )["chosen_cutoff"].unique()
+        for c in unique_cutoffs:
+            eff_cutoff = float(np.quantile(probs_g, 1.0 - float(c), method="linear"))
+            prob_threshold_rows.append(
+                {
+                    "reference_group": group_name,
+                    "stratified_by": "ppcr",
+                    "chosen_cutoff": float(c),
+                    "probability_threshold": eff_cutoff,
+                }
+            )
+
+    ppcr_threshold_df = pl.DataFrame(
+        prob_threshold_rows,
+        schema={
+            "reference_group": performance_data.schema["reference_group"],
+            "stratified_by": performance_data.schema["stratified_by"],
+            "chosen_cutoff": pl.Float64,
+            "probability_threshold": pl.Float64,
+        },
+    )
+
+    performance_data = performance_data.join(
+        ppcr_threshold_df,
+        on=["reference_group", "stratified_by", "chosen_cutoff"],
+        how="left",
+    ).with_columns(
+        pl.when(pl.col("stratified_by") == "probability_threshold")
+        .then(pl.col("chosen_cutoff"))
+        .otherwise(pl.col("probability_threshold"))
+        .alias("probability_threshold")
+    )
+
+    return performance_data.select(_PERFORMANCE_DATA_COLUMNS).sort(
+        ["reference_group", "stratified_by", "chosen_cutoff"]
+    )

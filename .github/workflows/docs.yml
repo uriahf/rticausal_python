@@ -1,0 +1,118 @@
+name: Documentation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, synchronize, closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: documentation-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Quarto
+        uses: quarto-dev/quarto-actions/setup@v2
+
+      - name: Install project and docs dependencies
+        run: uv sync --group docs
+
+      - name: Build Great Docs site
+        run: uv run great-docs build
+
+      - name: Export Great Tables performance table demo
+        run: uv run marimo export html --no-include-code examples/performance_table_demo.py -o great-docs/_site/performance-table-demo.html
+
+      - name: Export Reactable performance table demo
+        run: |
+          uv run quarto render examples/performance_table_reactable.qmd --output performance-table-reactable.html
+          grep -q '.Reactable {' performance-table-reactable.html
+          grep -q 'Real Positive' performance-table-reactable.html
+          mv performance-table-reactable.html great-docs/_site/performance-table-reactable.html
+          cp -R examples/performance_table_reactable_files great-docs/_site/performance_table_reactable_files
+
+      - name: Publish documentation
+        uses: JamesIves/github-pages-deploy-action@v4
+        with:
+          branch: gh-pages
+          folder: great-docs/_site
+          clean: true
+          clean-exclude: |
+            pr-preview/
+
+  preview:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv and Python
+        if: github.event.action != 'closed'
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Quarto
+        if: github.event.action != 'closed'
+        uses: quarto-dev/quarto-actions/setup@v2
+
+      - name: Install project and docs dependencies
+        if: github.event.action != 'closed'
+        run: uv sync --group docs
+
+      - name: Build Great Docs preview
+        if: github.event.action != 'closed'
+        run: uv run great-docs build
+
+      - name: Export Great Tables performance table demo
+        if: github.event.action != 'closed'
+        run: uv run marimo export html --no-include-code examples/performance_table_demo.py -o great-docs/_site/performance-table-demo.html
+
+      - name: Export Reactable performance table demo
+        if: github.event.action != 'closed'
+        run: |
+          uv run quarto render examples/performance_table_reactable.qmd --output performance-table-reactable.html
+          grep -q '.Reactable {' performance-table-reactable.html
+          grep -q 'Real Positive' performance-table-reactable.html
+          mv performance-table-reactable.html great-docs/_site/performance-table-reactable.html
+          cp -R examples/performance_table_reactable_files great-docs/_site/performance_table_reactable_files
+
+      - name: Generate rtichoke_viz ROC proof
+        if: github.event.action != 'closed'
+        run: |
+          uv run python examples/rtichoke_viz_roc.py
+          mkdir -p great-docs/_site/rtichoke-viz-roc
+          cp -R rtichoke_viz_roc_proof/. great-docs/_site/rtichoke-viz-roc/
+
+      - name: Generate rtichoke_viz calibration proof
+        if: github.event.action != 'closed'
+        run: |
+          uv run python examples/rtichoke_viz_calibration.py
+          mkdir -p great-docs/_site/rtichoke-viz-calibration
+          cp -R rtichoke_viz_calibration_proof/. great-docs/_site/rtichoke-viz-calibration/
+
+      - name: Deploy PR preview
+        uses: rossjrw/pr-preview-action@v1
+        with:
+          source-dir: great-docs/_site
+          preview-branch: gh-pages
+          umbrella-dir: pr-preview
+          action: auto
